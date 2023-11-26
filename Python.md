@@ -334,3 +334,198 @@ get
 为了避免 `pi` 值被修改，用之前提到的方法定义了一个只读的数据描述符。
 
 上述的代码中存在一个问题，当 `radius` 被修改后，圆的面积不会被更新。有很多办法来解决这个问题，但这个例子只是用来说明描述符的应用。
+
+## GIL(Global Interpreter Lock)
+
+### 1. Python GIL 的概念以及对多线程的影响
+
+- Pytho 语言和 GIL 没有关系，仅仅是因为历史原因在 CPython 虚拟机（解释器）中难以移除。
+- GIL：全局解释器锁，每个线程在执行的时候都需要先获取 GIL，以此来保证每个时刻只有一个线程可以执行。
+- 线程释放 GIL 的情况：在 IO 操作等可能引起阻塞的 System Call 之前，可以暂时释放 GIL，但在执行完毕之后必须重新获取。时间片用尽也会被强制释放。
+- Python 多进程是可以利用 CPU 的多个核心的。
+- 多线程爬取比单线程有提升，是因为遇到 IO 阻塞会自动释放 GIL。
+
+### 2. 避免 GIL 的方式
+
+调用其他语言的动态库函数作为子线程。
+
+```c
+// demo.c
+#include <stdio.h>
+
+void dead_loop() {
+    while (true) {
+        ;
+    }
+}
+```
+
+```bash
+gcc -shared -fPIC -o demo.so demo.c
+```
+
+```python
+from ctypes import cdll
+from threading import Thread
+
+lib = cdll.LoadLibrary('./demo.c')
+t = Thread(target=lib.dead_loop)
+t.start()
+
+while True:
+    pass
+```
+
+### 3. 为什么有 GIL 还要设置互斥锁
+
+GIL 是为了解决资源竞争问题，但竞争的内容是 CPU，保证了同时只运行一个线程；互斥锁避免的是对数据资源的竞争，防止数据错乱，使得业务能够顺利进行。
+
+## Garbage Collection(GC 垃圾回收)
+
+现在的高级语言如 java，c# 等，都采用了垃圾收集机制，而不再是 c，c++ 里用户自己管理维护内存的方式。自己管理内存极其自由，可以任意申请内存，但如同一把双刃剑，为大量内存泄露，悬空指针等 bug 埋下隐患。 对于一个字符串、列表、类甚至数值都是对象，且定位简单易用的语言，自然不会让用户去处理如何分配回收内存的问题。 python 里也同 java 一样采用了垃圾收集机制，不过不一样的是：python采用的是**引用计数机制**为主，**分代回收机制**为辅的策略。
+
+###  1. 引用计数机制
+
+**引用计数机制：** 每一个对象维护一小块内存存放自己的引用数量，当有一个新的对象引用它时，引用计数会增加，当引用它的对象被删除时，引用计数减少。当引用计数变为 0 时，对象的生命周期结束。
+
+**引用计数的优点：**
+
+- 简单
+- 实时性：一旦没有引用，内存就直接释放了。不用像其他机制等到特定时机。实时性还带来一个好处：处理回收内存的时间分摊到了平时。
+
+**引用计数的缺点：**
+
+- 维护引用计数消耗资源
+- 循环引用
+
+```python
+# 循环引用
+list1 = []
+list2 = []
+list1.append(list2)
+list2.append(list1)
+```
+
+`list1` 与 `list2` 相互引用，如果不存在其他对象对它们的引用，`list1` 与 `list2` 的引用计数也仍然为 1，所占用的内存永远无法被回收，这将是致命的。 对于如今的强大硬件，消耗资源的缺点尚可接受，但是循环引用导致的内存泄露，使得 python 必将引入新的回收机制（分代回收）。
+
+**导致引用计数增加的情况：**
+
+- 对象被创建，例如 `a = 23`
+- 对象被引用，例如 `b = a`
+- 对象被作为参数，传入到一个函数中，例如 `func(a)`
+- 对象作为一个元素，存储在容器中，例如 `list1 = [a, a]`
+
+**导致引用计数减少的情况：**
+
+- 对象的别名被显式销毁，例如 `del a`
+- 对象的别名被赋予新的对象，例如 `a = 24`
+- 一个对象离开它的作用域，例如函数执行完毕时，`func` 函数中的局部变量（全局变量不会）
+- 对象所在的容器被销毁，或从容器中删除对象
+
+**查看一个对象的引用计数：** 
+
+```python
+import sys
+a = "hello world"
+sys.getrefcount(a)
+# 可以查看 a 对象的引用计数，但是比正常计数大 1，因为调用函数的时候传入 a，这会让 a 的引用计数 +1
+```
+
+### 2. 标记-清理
+
+在介绍分代回收之前，先介绍标记删除机制。标记删除依赖两个容器来实现，分别是**死亡容器**和**存活容器**。
+
+**清理过程：**
+
+1. 对执行删除操作后的每个对象引用计数  -1，如果引用计数变为 0 将它们存储到死亡容器。
+2. 遍历存活容器，查看存活容器中是否有对象引用了死亡容器中的对象，如果有，将该死亡容器中的对象存储到存货容器
+3. 删除死亡容器中的所有对象
+
+经过这上述三个步骤，可以解决循环引用对象无法被清理的问题。
+
+### 3. 分代回收
+
+使用**标记-清理**方法，已经可以保证对垃圾的回收了，但还有一个问题，**标记-清理**该什么时候执行。这就是分代回收机制要解决的问题。
+
+- 分代回收是一种以空间换时间的操作方式，Python 将内存根据对象的存活时间划分为不同的集合，每个集合称为一个代，Python 将内存分为了 3 代，分别为年轻代（第 0 代）、中年代（第 1 代）、老年代（第 2 代），他们对应的是 3 个链表，它们的垃圾收集频率随着对象存活时间的增大而减小。
+- 新创建的对象都会分配在**年轻代**，年轻代链表的总数达到上限时（内存分配数减去内存释放数达到阈值），Python 垃圾收集机制就会被触发，把那些可以被回收的对象回收掉，而那些不会回收的对象就会被移到**中年代**去，依此类推，**老年代**中的对象是存活时间最久的对象，甚至是存活于整个系统的生命周期内。
+- 同时，分代回收是建立在标记清除技术基础之上。分代回收同样作为 Python 的辅助垃圾收集技术处理那些容器对象
+
+### 4. 触发垃圾回收
+
+1. 当 `gc` 模块的计数器达到阈值的时候，自动回收垃圾
+2. 调用 `gc.collect()`，手动回收垃圾
+3. 程序退出的时候，python 解释器来回收垃圾
+
+## logging 日志模块
+
+### 1. 输出到文件
+
+```python
+import logging
+
+logging.basicConfig(level=logging.DEBUG,
+                    filename = './demo.log'
+                    filemode = 'a'
+                    format='%(asctime)s - %(filename)s[line:%(lineno)d] - %(levelname)s: %(message)s')
+
+logging.info('message')
+```
+
+### 2. 同时输出到终端和文件
+
+```python
+import logging  
+  
+# 第一步，创建一个logger  
+logger = logging.getLogger()  
+logger.setLevel(logging.INFO)  # Log等级总开关  
+  
+# 第二步，创建一个handler，用于写入日志文件  
+logfile = './log.txt'  
+fh = logging.FileHandler(logfile, mode='a')  # open的打开模式这里可以进行参考
+fh.setLevel(logging.DEBUG)  # 输出到file的log等级的开关  
+  
+# 第三步，再创建一个handler，用于输出到控制台  
+ch = logging.StreamHandler()  
+ch.setLevel(logging.WARNING)   # 输出到console的log等级的开关  
+  
+# 第四步，定义handler的输出格式  
+formatter = logging.Formatter("%(asctime)s - %(filename)s[line:%(lineno)d] - %(levelname)s: %(message)s")  
+fh.setFormatter(formatter)  
+ch.setFormatter(formatter)  
+  
+# 第五步，将logger添加到handler里面  
+logger.addHandler(fh)  
+logger.addHandler(ch)  
+  
+# 日志  
+logger.debug('这是 logger debug message')  
+logger.info('这是 logger info message')  
+logger.warning('这是 logger warning message')  
+logger.error('这是 logger error message')  
+logger.critical('这是 logger critical message')
+```
+
+### 3. 日志格式说明
+
+`logging.basicConfig` 函数中，可以指定日志的输出格式 `format` ，这个参数可以输出很多有用的信息，如下:
+
+- `%(levelno)s`: 打印日志级别的数值
+- `%(levelname)s`: 打印日志级别名称
+- `%(pathname)s`: 打印当前执行程序的路径，其实就是 `sys.argv[0]`
+- `%(filename)s`: 打印当前执行程序名
+- `%(funcName)s`: 打印日志的当前函数
+- `%(lineno)d`: 打印日志的当前行号
+- `%(asctime)s`: 打印日志的时间
+- `%(thread)d`: 打印线程 ID
+- `%(threadName)s`: 打印线程名称
+- `%(process)d`: 打印进程 ID
+- `%(message)s`: 打印日志信息
+
+在工作中常用的格式如下：
+
+```python
+format ='%(asctime)s - %(filename)s[line:%(lineno)d] - %(levelname)s: %(message)s'
+```
+
